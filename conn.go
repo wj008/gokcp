@@ -42,7 +42,11 @@ type Conn struct {
 	xconn           batchConn // for x/net
 	xconnWriteError error
 
-	mu sync.Mutex
+	//绑定的数据
+	Context   any
+	IsConnect bool
+	OnClose   func()
+	mu        sync.Mutex
 }
 
 func newUDPConn(conv uint32, l *Listener, conn net.PacketConn, isOwn bool, remote net.Addr) *Conn {
@@ -55,6 +59,7 @@ func newUDPConn(conv uint32, l *Listener, conn net.PacketConn, isOwn bool, remot
 	co.remote = remote
 	co.conn = conn
 	co.isOwn = isOwn
+	co.IsConnect = true
 	co.l = l
 	co.recvbuf = make([]byte, mtuLimit)
 	// cast to writebatch conn
@@ -90,11 +95,11 @@ func newUDPConn(conv uint32, l *Listener, conn net.PacketConn, isOwn bool, remot
 	return co
 }
 
-func (s *Conn) defaultReadLoop() {
+func (c *Conn) defaultReadLoop() {
 	buf := make([]byte, mtuLimit)
 	var src string
 	for {
-		if n, addr, err := s.conn.ReadFrom(buf); err == nil {
+		if n, addr, err := c.conn.ReadFrom(buf); err == nil {
 			// make sure the packet is from the same source
 			if src == "" { // set source address
 				src = addr.String()
@@ -102,168 +107,167 @@ func (s *Conn) defaultReadLoop() {
 				atomic.AddUint64(&DefaultSnmp.InErrs, 1)
 				continue
 			}
-			s.packetInput(buf[:n])
+			c.packetInput(buf[:n])
 		} else {
-			s.notifyReadError(err)
+			c.notifyReadError(err)
 			return
 		}
 	}
 }
 
-func (s *Conn) Read(b []byte) (n int, err error) {
+func (c *Conn) Read(b []byte) (n int, err error) {
 	for {
-		s.mu.Lock()
-		if len(s.bufptr) > 0 { // copy from buffer into b
-			n = copy(b, s.bufptr)
-			s.bufptr = s.bufptr[n:]
-			s.mu.Unlock()
+		c.mu.Lock()
+		if len(c.bufptr) > 0 { // copy from buffer into b
+			n = copy(b, c.bufptr)
+			c.bufptr = c.bufptr[n:]
+			c.mu.Unlock()
 			atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(n))
 			return n, nil
 		}
 
-		if size := s.kcp.PeekSize(); size > 0 { // peek data size from kcp
+		if size := c.kcp.PeekSize(); size > 0 { // peek data size from kcp
 			if len(b) >= size { // receive data into 'b' directly
-				s.kcp.Recv(b)
-				s.mu.Unlock()
+				c.kcp.Recv(b)
+				c.mu.Unlock()
 				atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(size))
 				return size, nil
 			}
 			// if necessary resize the stream buffer to guarantee a sufficient buffer space
-			if cap(s.recvbuf) < size {
-				s.recvbuf = make([]byte, size)
+			if cap(c.recvbuf) < size {
+				c.recvbuf = make([]byte, size)
 			}
 			// resize the length of recvbuf to correspond to data size
-			s.recvbuf = s.recvbuf[:size]
-			s.kcp.Recv(s.recvbuf)
-			n = copy(b, s.recvbuf)   // copy to 'b'
-			s.bufptr = s.recvbuf[n:] // pointer update
-			s.mu.Unlock()
+			c.recvbuf = c.recvbuf[:size]
+			c.kcp.Recv(c.recvbuf)
+			n = copy(b, c.recvbuf)   // copy to 'b'
+			c.bufptr = c.recvbuf[n:] // pointer update
+			c.mu.Unlock()
 			atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(n))
 			return n, nil
 		}
 		// deadline for current reading operation
 		var timeout *time.Timer
-		var c <-chan time.Time
-		if !s.rd.IsZero() {
-			if time.Now().After(s.rd) {
-				s.mu.Unlock()
+		var tc <-chan time.Time
+		if !c.rd.IsZero() {
+			if time.Now().After(c.rd) {
+				c.mu.Unlock()
 				return 0, errTimeout
 			}
-			delay := time.Until(s.rd)
+			delay := time.Until(c.rd)
 			timeout = time.NewTimer(delay)
-			c = timeout.C
+			tc = timeout.C
 		}
-		s.mu.Unlock()
+		c.mu.Unlock()
 		// wait for read event or timeout or error
 		select {
-		case <-s.chReadEvent:
+		case <-c.chReadEvent:
 			if timeout != nil {
 				timeout.Stop()
 			}
-		case <-c:
+		case <-tc:
 			return 0, errTimeout
-		case <-s.readError.Done():
-			return 0, s.readError.Err()
-		case <-s.die.Done():
-			return 0, s.die.Err()
+		case <-c.readError.Done():
+			return 0, c.readError.Err()
+		case <-c.die.Done():
+			return 0, c.die.Err()
 		}
 	}
 }
 
 // Write implements net.Conn
-func (s *Conn) Write(b []byte) (n int, err error) { return s.WriteBuffers([][]byte{b}) }
+func (c *Conn) Write(b []byte) (n int, err error) { return c.WriteBuffers([][]byte{b}) }
 
 // WriteBuffers write a vector of byte slices to the underlying connection
-func (s *Conn) WriteBuffers(v [][]byte) (n int, err error) {
+func (c *Conn) WriteBuffers(v [][]byte) (n int, err error) {
 	for {
 		select {
-		case <-s.writeError.Done():
-			return 0, s.writeError.Err()
-		case <-s.die.Done():
-			return 0, s.die.Err()
+		case <-c.writeError.Done():
+			return 0, c.writeError.Err()
+		case <-c.die.Done():
+			return 0, c.die.Err()
 		default:
 		}
-
-		s.mu.Lock()
+		c.mu.Lock()
 		// make sure write do not overflow the max sliding window on both side
-		waitsnd := s.kcp.WaitSnd()
-		if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
+		waitsnd := c.kcp.WaitSnd()
+		if waitsnd < int(c.kcp.snd_wnd) && waitsnd < int(c.kcp.rmt_wnd) {
 			for _, b := range v {
 				n += len(b)
 				for {
-					if len(b) <= int(s.kcp.mss) {
-						s.kcp.Send(b)
+					if len(b) <= int(c.kcp.mss) {
+						c.kcp.Send(b)
 						break
 					} else {
-						s.kcp.Send(b[:s.kcp.mss])
-						b = b[s.kcp.mss:]
+						c.kcp.Send(b[:c.kcp.mss])
+						b = b[c.kcp.mss:]
 					}
 				}
 			}
 
-			waitsnd = s.kcp.WaitSnd()
-			if waitsnd >= int(s.kcp.snd_wnd) || waitsnd >= int(s.kcp.rmt_wnd) || !s.writeDelay {
-				s.kcp.flush(false)
-				s.uncork()
+			waitsnd = c.kcp.WaitSnd()
+			if waitsnd >= int(c.kcp.snd_wnd) || waitsnd >= int(c.kcp.rmt_wnd) || !c.writeDelay {
+				c.kcp.flush(false)
+				c.uncork()
 			}
-			s.mu.Unlock()
+			c.mu.Unlock()
 			atomic.AddUint64(&DefaultSnmp.BytesSent, uint64(n))
 			return n, nil
 		}
 		var timeout *time.Timer
-		var c <-chan time.Time
-		if !s.wd.IsZero() {
-			if time.Now().After(s.wd) {
-				s.mu.Unlock()
+		var tc <-chan time.Time
+		if !c.wd.IsZero() {
+			if time.Now().After(c.wd) {
+				c.mu.Unlock()
 				return 0, errTimeout
 			}
-			delay := time.Until(s.wd)
+			delay := time.Until(c.wd)
 			timeout = time.NewTimer(delay)
-			c = timeout.C
+			tc = timeout.C
 		}
-		s.mu.Unlock()
+		c.mu.Unlock()
 
 		select {
-		case <-s.chWriteEvent:
+		case <-c.chWriteEvent:
 			if timeout != nil {
 				timeout.Stop()
 			}
-		case <-c:
+		case <-tc:
 			return 0, errTimeout
-		case <-s.writeError.Done():
-			return 0, s.writeError.Err()
-		case <-s.die.Done():
-			return 0, s.die.Err()
+		case <-c.writeError.Done():
+			return 0, c.writeError.Err()
+		case <-c.die.Done():
+			return 0, c.die.Err()
 		}
 	}
 }
 
 // uncork sends data in txqueue if there is any
-func (s *Conn) uncork() {
-	if len(s.txqueue) > 0 {
-		s.tx(s.txqueue)
+func (c *Conn) uncork() {
+	if len(c.txqueue) > 0 {
+		c.tx(c.txqueue)
 		// recycle
-		for k := range s.txqueue {
-			xmitBuf.Put(s.txqueue[k].Buffers[0])
-			s.txqueue[k].Buffers = nil
+		for k := range c.txqueue {
+			xmitBuf.Put(c.txqueue[k].Buffers[0])
+			c.txqueue[k].Buffers = nil
 		}
-		s.txqueue = s.txqueue[:0]
+		c.txqueue = c.txqueue[:0]
 	}
 }
 
-func (s *Conn) tx(txqueue []ipv4.Message) {
-	s.defaultTx(txqueue)
+func (c *Conn) tx(txqueue []ipv4.Message) {
+	c.defaultTx(txqueue)
 }
 
-func (s *Conn) defaultTx(txqueue []ipv4.Message) {
+func (c *Conn) defaultTx(txqueue []ipv4.Message) {
 	nbytes := 0
 	npkts := 0
 	for k := range txqueue {
-		if n, err := s.conn.WriteTo(txqueue[k].Buffers[0], txqueue[k].Addr); err == nil {
+		if n, err := c.conn.WriteTo(txqueue[k].Buffers[0], txqueue[k].Addr); err == nil {
 			nbytes += n
 			npkts++
 		} else {
-			s.notifyWriteError(err)
+			c.notifyWriteError(err)
 			break
 		}
 	}
@@ -271,25 +275,30 @@ func (s *Conn) defaultTx(txqueue []ipv4.Message) {
 	atomic.AddUint64(&DefaultSnmp.OutBytes, uint64(nbytes))
 }
 
-func (s *Conn) Close() error {
+func (c *Conn) Close() error {
 	var once bool
-	s.die.Do(io.ErrClosedPipe, func() {
+	c.die.Do(io.ErrClosedPipe, func() {
 		once = true
 	})
 	if once {
+		if c.OnClose != nil {
+			c.OnClose()
+		}
+		c.IsConnect = false
+
 		atomic.AddUint64(&DefaultSnmp.CurrEstab, ^uint64(0))
 		// try best to send all queued messages
-		s.mu.Lock()
-		s.kcp.flush(false)
-		s.uncork()
+		c.mu.Lock()
+		c.kcp.flush(false)
+		c.uncork()
 		// release pending segments
-		s.kcp.ReleaseTX()
-		s.mu.Unlock()
-		if s.l != nil { // belongs to listener
-			s.l.closeSession(s.remote)
+		c.kcp.ReleaseTX()
+		c.mu.Unlock()
+		if c.l != nil { // belongs to listener
+			c.l.closeSession(c.remote)
 			return nil
-		} else if s.isOwn { // client socket close
-			return s.conn.Close()
+		} else if c.isOwn { // client socket close
+			return c.conn.Close()
 		} else {
 			return nil
 		}
@@ -299,110 +308,110 @@ func (s *Conn) Close() error {
 }
 
 // LocalAddr returns the local network address. The Addr returned is shared by all invocations of LocalAddr, so do not modify it.
-func (s *Conn) LocalAddr() net.Addr { return s.conn.LocalAddr() }
+func (c *Conn) LocalAddr() net.Addr { return c.conn.LocalAddr() }
 
 // RemoteAddr returns the remote network address. The Addr returned is shared by all invocations of RemoteAddr, so do not modify it.
-func (s *Conn) RemoteAddr() net.Addr { return s.remote }
+func (c *Conn) RemoteAddr() net.Addr { return c.remote }
 
 // SetDeadline sets the deadline associated with the listener. A zero time value disables the deadline.
-func (s *Conn) SetDeadline(t time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.rd = t
-	s.wd = t
-	s.notifyReadEvent()
-	s.notifyWriteEvent()
+func (c *Conn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rd = t
+	c.wd = t
+	c.notifyReadEvent()
+	c.notifyWriteEvent()
 	return nil
 }
 
 // SetReadDeadline implements the Conn SetReadDeadline method.
-func (s *Conn) SetReadDeadline(t time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.rd = t
-	s.notifyReadEvent()
+func (c *Conn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rd = t
+	c.notifyReadEvent()
 	return nil
 }
 
 // SetWriteDeadline implements the Conn SetWriteDeadline method.
-func (s *Conn) SetWriteDeadline(t time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.wd = t
-	s.notifyWriteEvent()
+func (c *Conn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.wd = t
+	c.notifyWriteEvent()
 	return nil
 }
 
 // SetWriteDelay delays write for bulk transfer until the next update interval
-func (s *Conn) SetWriteDelay(delay bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.writeDelay = delay
+func (c *Conn) SetWriteDelay(delay bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.writeDelay = delay
 }
 
 // SetWindowSize set maximum window size
-func (s *Conn) SetWindowSize(sndwnd, rcvwnd int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.kcp.WndSize(sndwnd, rcvwnd)
+func (c *Conn) SetWindowSize(sndwnd, rcvwnd int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.kcp.WndSize(sndwnd, rcvwnd)
 }
 
 // SetMtu sets the maximum transmission unit(not including UDP header)
-func (s *Conn) SetMtu(mtu int) bool {
+func (c *Conn) SetMtu(mtu int) bool {
 	if mtu > mtuLimit {
 		return false
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.kcp.SetMtu(mtu)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.kcp.SetMtu(mtu)
 	return true
 }
 
 // SetStreamMode toggles the stream mode on/off
-func (s *Conn) SetStreamMode(enable bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (c *Conn) SetStreamMode(enable bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if enable {
-		s.kcp.stream = 1
+		c.kcp.stream = 1
 	} else {
-		s.kcp.stream = 0
+		c.kcp.stream = 0
 	}
 }
 
 // SetACKNoDelay changes ack flush option, set true to flush ack immediately,
-func (s *Conn) SetACKNoDelay(nodelay bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.ackNoDelay = nodelay
+func (c *Conn) SetACKNoDelay(nodelay bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ackNoDelay = nodelay
 }
 
-func (s *Conn) SetDUP(dup int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.dup = dup
+func (c *Conn) SetDUP(dup int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.dup = dup
 }
 
 // SetNoDelay calls nodelay() of kcp
 // https://github.com/skywind3000/kcp/blob/master/README.en.md#protocol-configuration
-func (s *Conn) SetNoDelay(nodelay, interval, resend, nc int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.kcp.NoDelay(nodelay, interval, resend, nc)
+func (c *Conn) SetNoDelay(nodelay, interval, resend, nc int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.kcp.NoDelay(nodelay, interval, resend, nc)
 }
 
-func (s *Conn) SetDSCP(dscp int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.l != nil {
+func (c *Conn) SetDSCP(dscp int) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.l != nil {
 		return errInvalidOperation
 	}
 
 	// interface enabled
-	if ts, ok := s.conn.(setDSCP); ok {
+	if ts, ok := c.conn.(setDSCP); ok {
 		return ts.SetDSCP(dscp)
 	}
 
-	if nc, ok := s.conn.(net.Conn); ok {
+	if nc, ok := c.conn.(net.Conn); ok {
 		var succeed bool
 		if err := ipv4.NewConn(nc).SetTOS(dscp << 2); err == nil {
 			succeed = true
@@ -418,127 +427,127 @@ func (s *Conn) SetDSCP(dscp int) error {
 	return errInvalidOperation
 }
 
-func (s *Conn) SetReadBuffer(bytes int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.l == nil {
-		if nc, ok := s.conn.(setReadBuffer); ok {
+func (c *Conn) SetReadBuffer(bytes int) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.l == nil {
+		if nc, ok := c.conn.(setReadBuffer); ok {
 			return nc.SetReadBuffer(bytes)
 		}
 	}
 	return errInvalidOperation
 }
 
-func (s *Conn) SetWriteBuffer(bytes int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.l == nil {
-		if nc, ok := s.conn.(setWriteBuffer); ok {
+func (c *Conn) SetWriteBuffer(bytes int) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.l == nil {
+		if nc, ok := c.conn.(setWriteBuffer); ok {
 			return nc.SetWriteBuffer(bytes)
 		}
 	}
 	return errInvalidOperation
 }
 
-func (s *Conn) update() {
+func (c *Conn) update() {
 	select {
-	case <-s.die.Done():
+	case <-c.die.Done():
 	default:
-		s.mu.Lock()
-		interval := s.kcp.flush(false)
-		waitsnd := s.kcp.WaitSnd()
-		if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
-			s.notifyWriteEvent()
+		c.mu.Lock()
+		interval := c.kcp.flush(false)
+		waitsnd := c.kcp.WaitSnd()
+		if waitsnd < int(c.kcp.snd_wnd) && waitsnd < int(c.kcp.rmt_wnd) {
+			c.notifyWriteEvent()
 		}
-		s.uncork()
-		s.mu.Unlock()
+		c.uncork()
+		c.mu.Unlock()
 		// self-synchronized timed scheduling
-		SystemTimedSched.Put(s.update, time.Now().Add(time.Duration(interval)*time.Millisecond))
+		SystemTimedSched.Put(c.update, time.Now().Add(time.Duration(interval)*time.Millisecond))
 	}
 }
 
-func (s *Conn) GetConv() uint32 { return s.kcp.conv }
+func (c *Conn) GetConv() uint32 { return c.kcp.conv }
 
-func (s *Conn) GetRTO() uint32 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.kcp.rx_rto
+func (c *Conn) GetRTO() uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.kcp.rx_rto
 }
 
-func (s *Conn) GetSRTT() int32 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.kcp.rx_srtt
+func (c *Conn) GetSRTT() int32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.kcp.rx_srtt
 }
 
-func (s *Conn) GetSRTTVar() int32 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.kcp.rx_rttvar
+func (c *Conn) GetSRTTVar() int32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.kcp.rx_rttvar
 }
 
-func (s *Conn) notifyReadEvent() {
+func (c *Conn) notifyReadEvent() {
 	select {
-	case s.chReadEvent <- struct{}{}:
+	case c.chReadEvent <- struct{}{}:
 	default:
 	}
 }
 
-func (s *Conn) notifyWriteEvent() {
+func (c *Conn) notifyWriteEvent() {
 	select {
-	case s.chWriteEvent <- struct{}{}:
+	case c.chWriteEvent <- struct{}{}:
 	default:
 	}
 }
 
-func (s *Conn) notifyReadError(err error) {
-	s.readError.Cancel(err)
+func (c *Conn) notifyReadError(err error) {
+	c.readError.Cancel(err)
 }
 
-func (s *Conn) notifyWriteError(err error) {
-	s.writeError.Cancel(err)
+func (c *Conn) notifyWriteError(err error) {
+	c.writeError.Cancel(err)
 }
 
-func (s *Conn) output(buf []byte) {
+func (c *Conn) output(buf []byte) {
 	var ecc [][]byte
 	var msg ipv4.Message
-	for i := 0; i < s.dup+1; i++ {
+	for i := 0; i < c.dup+1; i++ {
 		bts := xmitBuf.Get().([]byte)[:len(buf)]
 		copy(bts, buf)
 		msg.Buffers = [][]byte{bts}
-		msg.Addr = s.remote
-		s.txqueue = append(s.txqueue, msg)
+		msg.Addr = c.remote
+		c.txqueue = append(c.txqueue, msg)
 	}
 	for k := range ecc {
 		bts := xmitBuf.Get().([]byte)[:len(ecc[k])]
 		copy(bts, ecc[k])
 		msg.Buffers = [][]byte{bts}
-		msg.Addr = s.remote
-		s.txqueue = append(s.txqueue, msg)
+		msg.Addr = c.remote
+		c.txqueue = append(c.txqueue, msg)
 	}
 }
 
-func (s *Conn) packetInput(data []byte) {
+func (c *Conn) packetInput(data []byte) {
 	if len(data) >= IKCP_OVERHEAD {
-		s.kcpInput(data)
+		c.kcpInput(data)
 	}
 }
 
-func (s *Conn) kcpInput(data []byte) {
+func (c *Conn) kcpInput(data []byte) {
 	var kcpInErrors uint64
-	s.mu.Lock()
-	if ret := s.kcp.Input(data, true, s.ackNoDelay); ret != 0 {
+	c.mu.Lock()
+	if ret := c.kcp.Input(data, true, c.ackNoDelay); ret != 0 {
 		kcpInErrors++
 	}
-	if n := s.kcp.PeekSize(); n > 0 {
-		s.notifyReadEvent()
+	if n := c.kcp.PeekSize(); n > 0 {
+		c.notifyReadEvent()
 	}
-	waitsnd := s.kcp.WaitSnd()
-	if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
-		s.notifyWriteEvent()
+	waitsnd := c.kcp.WaitSnd()
+	if waitsnd < int(c.kcp.snd_wnd) && waitsnd < int(c.kcp.rmt_wnd) {
+		c.notifyWriteEvent()
 	}
-	s.uncork()
-	s.mu.Unlock()
+	c.uncork()
+	c.mu.Unlock()
 	atomic.AddUint64(&DefaultSnmp.InPkts, 1)
 	atomic.AddUint64(&DefaultSnmp.InBytes, uint64(len(data)))
 	if kcpInErrors > 0 {
