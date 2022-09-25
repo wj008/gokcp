@@ -37,6 +37,7 @@ type Listener struct {
 	die          *Cancel       // notify the listener has closed
 	readError    *Cancel       // socket error handling
 	rd           atomic.Value  // read deadline for Accept()
+	OnConnect    func(*Conn)
 }
 
 func (l *Listener) packetInput(data []byte, addr net.Addr) {
@@ -193,4 +194,24 @@ func Listen(laddr string) (*Listener, error) {
 	l.readError = NewCancel()
 	go l.monitor()
 	return l, nil
+}
+
+func NewServer(addr string) (*Listener, error) {
+	listener, err := Listen(addr)
+	if err != nil {
+		return nil, err
+	}
+	go func() {
+		for {
+			c, err := listener.AcceptKCP()
+			if err != nil {
+				listener.Close()
+				return
+			}
+			if listener.OnConnect != nil {
+				go listener.OnConnect(c)
+			}
+		}
+	}()
+	return listener, nil
 }
