@@ -1,12 +1,12 @@
 package gokcp
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"io"
-	"log"
 	"net"
 	"sync/atomic"
 	"time"
@@ -37,7 +37,10 @@ type Listener struct {
 	die          *Cancel       // notify the listener has closed
 	readError    *Cancel       // socket error handling
 	rd           atomic.Value  // read deadline for Accept()
-	OnConnect    func(*Conn)
+	OnConnect    func(context.Context, *Conn)
+
+	cancel  context.CancelFunc
+	Context context.Context
 }
 
 func (l *Listener) packetInput(data []byte, addr net.Addr) {
@@ -141,6 +144,7 @@ func (l *Listener) SetWriteDeadline(t time.Time) error { return errInvalidOperat
 func (l *Listener) Close() error {
 	var once bool
 	l.die.Do(io.ErrClosedPipe, func() {
+		l.cancel()
 		once = true
 	})
 	var err error
@@ -153,7 +157,6 @@ func (l *Listener) Close() error {
 }
 
 func (l *Listener) closeSession(remote net.Addr) (ret bool) {
-	log.Println("链接关闭", remote)
 	addr := remote.String()
 	if _, ok := l.manager.Load(addr); ok {
 		l.manager.Delete(addr)
@@ -192,6 +195,7 @@ func Listen(laddr string) (*Listener, error) {
 	l.chConnClosed = make(chan net.Addr)
 	l.die = NewCancel()
 	l.readError = NewCancel()
+	l.Context, l.cancel = context.WithCancel(context.Background())
 	go l.monitor()
 	return l, nil
 }
@@ -209,7 +213,7 @@ func NewServer(addr string) (*Listener, error) {
 				return
 			}
 			if listener.OnConnect != nil {
-				go listener.OnConnect(c)
+				go listener.OnConnect(listener.Context, c)
 			}
 		}
 	}()
