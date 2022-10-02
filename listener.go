@@ -38,6 +38,7 @@ type Listener struct {
 	readError    *Cancel       // socket error handling
 	rd           atomic.Value  // read deadline for Accept()
 	OnConnect    func(context.Context, *Conn)
+	OnDisconnect func(context.Context, *Conn)
 
 	cancel  context.CancelFunc
 	Context context.Context
@@ -158,7 +159,10 @@ func (l *Listener) Close() error {
 
 func (l *Listener) closeSession(remote net.Addr) (ret bool) {
 	addr := remote.String()
-	if _, ok := l.manager.Load(addr); ok {
+	if conn, ok := l.manager.Load(addr); ok {
+		if l.OnDisconnect != nil {
+			l.OnDisconnect(l.Context, conn)
+		}
 		l.manager.Delete(addr)
 		return true
 	}
