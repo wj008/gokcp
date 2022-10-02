@@ -16,7 +16,7 @@ type Conn struct {
 	conn  net.PacketConn
 	isOwn bool
 	kcp   *KCP
-	l     *Listener
+	L     *Listener
 
 	recvbuf []byte
 	bufptr  []byte
@@ -60,7 +60,7 @@ func newUDPConn(conv uint32, l *Listener, conn net.PacketConn, isOwn bool, remot
 	co.conn = conn
 	co.isOwn = isOwn
 	co.IsConnect = true
-	co.l = l
+	co.L = l
 	co.recvbuf = make([]byte, mtuLimit)
 	// cast to writebatch conn
 	if _, ok := conn.(*net.UDPConn); ok {
@@ -79,7 +79,7 @@ func newUDPConn(conv uint32, l *Listener, conn net.PacketConn, isOwn bool, remot
 		}
 	})
 	co.kcp.ReserveBytes(0)
-	if co.l == nil { // it's a client connection
+	if co.L == nil { // it's a client connection
 		go co.defaultReadLoop()
 		atomic.AddUint64(&DefaultSnmp.ActiveOpens, 1)
 	} else {
@@ -294,8 +294,8 @@ func (c *Conn) Close() error {
 		// release pending segments
 		c.kcp.ReleaseTX()
 		c.mu.Unlock()
-		if c.l != nil { // belongs to listener
-			c.l.closeSession(c.remote)
+		if c.L != nil { // belongs to listener
+			c.L.closeSession(c.remote)
 			return nil
 		} else if c.isOwn { // client socket close
 			return c.conn.Close()
@@ -402,7 +402,7 @@ func (c *Conn) SetNoDelay(nodelay, interval, resend, nc int) {
 func (c *Conn) SetDSCP(dscp int) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.l != nil {
+	if c.L != nil {
 		return errInvalidOperation
 	}
 
@@ -430,7 +430,7 @@ func (c *Conn) SetDSCP(dscp int) error {
 func (c *Conn) SetReadBuffer(bytes int) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.l == nil {
+	if c.L == nil {
 		if nc, ok := c.conn.(setReadBuffer); ok {
 			return nc.SetReadBuffer(bytes)
 		}
@@ -441,7 +441,7 @@ func (c *Conn) SetReadBuffer(bytes int) error {
 func (c *Conn) SetWriteBuffer(bytes int) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.l == nil {
+	if c.L == nil {
 		if nc, ok := c.conn.(setWriteBuffer); ok {
 			return nc.SetWriteBuffer(bytes)
 		}
