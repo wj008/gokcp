@@ -31,7 +31,7 @@ type setDSCP interface {
 
 type Listener struct {
 	conn         net.PacketConn
-	manager      *ConnManager
+	Manager      *ConnManager
 	chAccepts    chan *Conn    // Listen() backlog
 	chConnClosed chan net.Addr // session close queue
 	die          *Cancel       // notify the listener has closed
@@ -46,7 +46,7 @@ type Listener struct {
 
 func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	if len(data) >= IKCP_OVERHEAD {
-		s, ok := l.manager.Load(addr.String())
+		s, ok := l.Manager.Load(addr.String())
 		var conv, sn uint32
 		conv = binary.LittleEndian.Uint32(data)
 		sn = binary.LittleEndian.Uint32(data[IKCP_SN_OFFSET:])
@@ -62,7 +62,7 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 			if len(l.chAccepts) < cap(l.chAccepts) { // do not let the new sessions overwhelm accept queue
 				s := newUDPConn(conv, l, l.conn, false, addr)
 				s.kcpInput(data)
-				l.manager.Store(addr.String(), s)
+				l.Manager.Store(addr.String(), s)
 				l.chAccepts <- s
 			}
 		}
@@ -71,7 +71,7 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 
 func (l *Listener) notifyReadError(err error) {
 	l.readError.Do(err, func() {
-		l.manager.Range(func(_ string, conn *Conn) bool {
+		l.Manager.Range(func(_ string, conn *Conn) bool {
 			conn.notifyReadError(err)
 			return true
 		})
@@ -159,11 +159,11 @@ func (l *Listener) Close() error {
 
 func (l *Listener) closeSession(remote net.Addr) (ret bool) {
 	addr := remote.String()
-	if conn, ok := l.manager.Load(addr); ok {
+	if conn, ok := l.Manager.Load(addr); ok {
 		if l.OnDisconnect != nil {
 			l.OnDisconnect(l.Context, conn)
 		}
-		l.manager.Delete(addr)
+		l.Manager.Delete(addr)
 		return true
 	}
 	return false
@@ -194,7 +194,7 @@ func Listen(laddr string) (*Listener, error) {
 	}
 	l := new(Listener)
 	l.conn = conn
-	l.manager = new(ConnManager)
+	l.Manager = new(ConnManager)
 	l.chAccepts = make(chan *Conn, 128)
 	l.chConnClosed = make(chan net.Addr)
 	l.die = NewCancel()

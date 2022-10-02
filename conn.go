@@ -581,6 +581,6 @@ func DialByListener(raddr string, l *Listener) (*Conn, error) {
 	var convid uint32
 	binary.Read(rand.Reader, binary.LittleEndian, &convid)
 	s := newUDPConn(convid, l, l.conn, false, udpaddr)
-	l.manager.Store(raddr, s)
+	l.Manager.Store(raddr, s)
 	return s, nil
 }
